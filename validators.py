@@ -146,7 +146,7 @@ def check_reroast_missing_retest(db: Session) -> list:
 
 def check_person_todo_backlog(db: Session, threshold: int = 5) -> list:
     alerts = []
-    todo_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast"]
+    todo_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable"]
 
     persons = db.query(models.Person).all()
     for person in persons:

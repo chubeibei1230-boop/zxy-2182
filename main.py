@@ -151,6 +151,12 @@ def update_tea_stock(
     stock = db.query(models.TeaStock).filter(models.TeaStock.id == stock_id).first()
     if not stock:
         raise HTTPException(status_code=404, detail="茶坯不存在")
+    duplicate = db.query(models.TeaStock).filter(
+        models.TeaStock.batch_no == data.batch_no,
+        models.TeaStock.id != stock_id
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail=f"茶坯批号 '{data.batch_no}' 已存在，无法修改")
     for key, value in data.model_dump().items():
         setattr(stock, key, value)
     db.commit()
@@ -206,6 +212,12 @@ def update_furnace(
     furnace = db.query(models.Furnace).filter(models.Furnace.id == furnace_id).first()
     if not furnace:
         raise HTTPException(status_code=404, detail="焙火炉不存在")
+    duplicate = db.query(models.Furnace).filter(
+        models.Furnace.furnace_no == data.furnace_no,
+        models.Furnace.id != furnace_id
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail=f"焙火炉号 '{data.furnace_no}' 已存在，无法修改")
     for key, value in data.model_dump().items():
         setattr(furnace, key, value)
     db.commit()
@@ -261,6 +273,12 @@ def update_fire_level(
     level = db.query(models.FireLevel).filter(models.FireLevel.id == level_id).first()
     if not level:
         raise HTTPException(status_code=404, detail="火候等级不存在")
+    duplicate = db.query(models.FireLevel).filter(
+        models.FireLevel.level_code == data.level_code,
+        models.FireLevel.id != level_id
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail=f"火候等级编码 '{data.level_code}' 已存在，无法修改")
     for key, value in data.model_dump().items():
         setattr(level, key, value)
     db.commit()
@@ -316,6 +334,12 @@ def update_cabinet(
     cabinet = db.query(models.Cabinet).filter(models.Cabinet.id == cabinet_id).first()
     if not cabinet:
         raise HTTPException(status_code=404, detail="静置柜位不存在")
+    duplicate = db.query(models.Cabinet).filter(
+        models.Cabinet.cabinet_no == data.cabinet_no,
+        models.Cabinet.id != cabinet_id
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail=f"静置柜位号 '{data.cabinet_no}' 已存在，无法修改")
     for key, value in data.model_dump().items():
         setattr(cabinet, key, value)
     db.commit()
@@ -371,6 +395,12 @@ def update_person(
     person = db.query(models.Person).filter(models.Person.id == person_id).first()
     if not person:
         raise HTTPException(status_code=404, detail="责任人不存在")
+    duplicate = db.query(models.Person).filter(
+        models.Person.person_no == data.person_no,
+        models.Person.id != person_id
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail=f"责任人编号 '{data.person_no}' 已存在，无法修改")
     for key, value in data.model_dump().items():
         setattr(person, key, value)
     db.commit()
@@ -402,6 +432,20 @@ def create_batch(
         raise HTTPException(status_code=400, detail="必须指定计划入炉和出炉时间")
     if data.plan_roast_end <= data.plan_roast_start:
         raise HTTPException(status_code=400, detail="计划出炉时间必须晚于入炉时间")
+
+    missing_refs = []
+    if not db.query(models.TeaStock).filter(models.TeaStock.id == data.tea_stock_id).first():
+        missing_refs.append(f"茶坯ID={data.tea_stock_id}")
+    if not db.query(models.Furnace).filter(models.Furnace.id == data.furnace_id).first():
+        missing_refs.append(f"焙火炉ID={data.furnace_id}")
+    if not db.query(models.FireLevel).filter(models.FireLevel.id == data.fire_level_id).first():
+        missing_refs.append(f"火候等级ID={data.fire_level_id}")
+    if not db.query(models.Person).filter(models.Person.id == data.person_id).first():
+        missing_refs.append(f"责任人ID={data.person_id}")
+    if data.cabinet_id and not db.query(models.Cabinet).filter(models.Cabinet.id == data.cabinet_id).first():
+        missing_refs.append(f"静置柜位ID={data.cabinet_id}")
+    if missing_refs:
+        raise HTTPException(status_code=400, detail=f"引用的基础数据不存在: {', '.join(missing_refs)}")
 
     conflicts = validators.check_furnace_conflict(
         db, data.furnace_id, data.plan_roast_start, data.plan_roast_end
@@ -515,7 +559,7 @@ def create_process_record(
             furnace.status = "idle"
 
     elif data.record_type == "to_cabinet":
-        batch.status = "standing"
+        batch.status = "pending_retest"
         batch.cabinet_start = now
 
         if data.burnt_edge_level is not None and (data.burnt_edge_level < 0 or data.burnt_edge_level > 5):
@@ -539,7 +583,7 @@ def create_process_record(
             batch.status = "need_reroast"
 
     elif data.record_type == "delivery":
-        batch.status = "deliverable"
+        batch.status = "delivered"
 
         cabinet = db.query(models.Cabinet).filter(models.Cabinet.id == batch.cabinet_id).first()
         if cabinet:
@@ -580,11 +624,11 @@ def list_batch_records(
 @app.put("/qc/batches/{batch_id}/status")
 def update_batch_status(
     batch_id: int,
-    new_status: str = Query(..., description="新状态: pending_in/roasting/standing/pending_retest/need_reroast/deliverable/paused"),
+    new_status: str = Query(..., description="新状态: pending_in/roasting/standing/pending_retest/need_reroast/deliverable/delivered/paused"),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_qc)
 ):
-    valid_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable", "paused"]
+    valid_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable", "delivered", "paused"]
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"无效状态。有效值: {', '.join(valid_statuses)}")
 
@@ -701,7 +745,7 @@ def get_delivery_trend(
         ).count()
 
         delivered = db.query(models.Batch).filter(
-            models.Batch.status == "deliverable",
+            models.Batch.status == "delivered",
             models.Batch.updated_at >= datetime.combine(current_date, datetime.min.time()),
             models.Batch.updated_at < datetime.combine(next_date, datetime.min.time())
         ).count()
@@ -722,7 +766,7 @@ def get_person_backlog(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    todo_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast"]
+    todo_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable"]
     persons = db.query(models.Person).all()
     results = []
 
