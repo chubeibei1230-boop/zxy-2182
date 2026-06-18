@@ -110,6 +110,7 @@ class Batch(Base):
     process_records = relationship("ProcessRecord", back_populates="batch", cascade="all, delete-orphan")
     anomaly_disposals = relationship("AnomalyDisposal", back_populates="batch", cascade="all, delete-orphan")
     delivery_confirmations = relationship("DeliveryConfirmation", back_populates="batch")
+    reroast_tasks = relationship("ReroastTask", back_populates="batch", cascade="all, delete-orphan")
 
 
 class DeliveryConfirmation(Base):
@@ -138,6 +139,7 @@ class ProcessRecord(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False)
+    reroast_task_id = Column(Integer, ForeignKey("reroast_tasks.id"))
     record_type = Column(String(30), nullable=False)  # in_furnace/out_furnace/to_cabinet/retest/delivery
     temperature = Column(Float)
     aroma_description = Column(Text)
@@ -150,6 +152,7 @@ class ProcessRecord(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow)
 
     batch = relationship("Batch", back_populates="process_records")
+    reroast_task = relationship("ReroastTask", back_populates="process_records", foreign_keys=[reroast_task_id])
     recorder = relationship("User", back_populates="records")
     anomaly_disposals = relationship("AnomalyDisposal", back_populates="process_record")
 
@@ -180,3 +183,37 @@ class AnomalyDisposal(Base):
     responsible_person = relationship("Person", foreign_keys=[responsible_person_id])
     creator = relationship("User", foreign_keys=[created_by])
     handler = relationship("User", foreign_keys=[handled_by])
+
+
+class ReroastTask(Base):
+    __tablename__ = "reroast_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_no = Column(String(50), unique=True, index=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False)
+    anomaly_disposal_id = Column(Integer, ForeignKey("anomaly_disposals.id"))
+    reroast_reason = Column(Text, nullable=False)
+    suggested_fire_level_id = Column(Integer, ForeignKey("fire_levels.id"), nullable=False)
+    plan_in_furnace_time = Column(DateTime)
+    plan_out_furnace_time = Column(DateTime)
+    actual_in_furnace_time = Column(DateTime)
+    actual_out_furnace_time = Column(DateTime)
+    retest_record_id = Column(Integer, ForeignKey("process_records.id"))
+    retest_conclusion = Column(String(20))
+    responsible_person_id = Column(Integer, ForeignKey("persons.id"), nullable=False)
+    status = Column(String(20), default="pending_arrangement")
+    reroast_count = Column(Integer, default=1)
+    remarks = Column(Text)
+    cancel_reason = Column(Text)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
+    cancelled_at = Column(DateTime)
+
+    batch = relationship("Batch", back_populates="reroast_tasks")
+    anomaly_disposal = relationship("AnomalyDisposal")
+    suggested_fire_level = relationship("FireLevel")
+    responsible_person = relationship("Person", foreign_keys=[responsible_person_id])
+    retest_record = relationship("ProcessRecord", foreign_keys=[retest_record_id], post_update=True)
+    creator = relationship("User", foreign_keys=[created_by])
+    process_records = relationship("ProcessRecord", back_populates="reroast_task", foreign_keys="ProcessRecord.reroast_task_id")

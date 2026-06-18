@@ -370,3 +370,126 @@ class DeliverySummaryResponse(BaseModel):
     pending_delivery_count: int = Field(..., description="待交付数量")
     delivered_count: int = Field(..., description="已交付数量")
     recent_7day_trend: List[DeliveryTrendItem] = Field(..., description="近7日交付趋势")
+
+
+class ReroastTaskBase(BaseModel):
+    batch_id: int = Field(..., description="批次ID")
+    anomaly_disposal_id: Optional[int] = Field(None, description="关联异常处置单ID")
+    reroast_reason: str = Field(..., description="返焙原因")
+    suggested_fire_level_id: int = Field(..., description="建议火候等级ID")
+    plan_in_furnace_time: Optional[datetime] = Field(None, description="计划入炉时间")
+    plan_out_furnace_time: Optional[datetime] = Field(None, description="计划出炉时间")
+    responsible_person_id: int = Field(..., description="责任人ID")
+    remarks: Optional[str] = Field(None, description="备注")
+
+
+class ReroastTaskCreate(ReroastTaskBase):
+    pass
+
+
+class ReroastTaskUpdate(BaseModel):
+    anomaly_disposal_id: Optional[int] = Field(None, description="关联异常处置单ID")
+    reroast_reason: Optional[str] = Field(None, description="返焙原因")
+    suggested_fire_level_id: Optional[int] = Field(None, description="建议火候等级ID")
+    plan_in_furnace_time: Optional[datetime] = Field(None, description="计划入炉时间")
+    plan_out_furnace_time: Optional[datetime] = Field(None, description="计划出炉时间")
+    responsible_person_id: Optional[int] = Field(None, description="责任人ID")
+    remarks: Optional[str] = Field(None, description="备注")
+
+
+class ReroastTaskResponse(BaseModel):
+    id: int
+    task_no: str
+    batch_id: int
+    anomaly_disposal_id: Optional[int]
+    reroast_reason: str
+    suggested_fire_level_id: int
+    plan_in_furnace_time: Optional[datetime]
+    plan_out_furnace_time: Optional[datetime]
+    actual_in_furnace_time: Optional[datetime]
+    actual_out_furnace_time: Optional[datetime]
+    retest_record_id: Optional[int]
+    retest_conclusion: Optional[str]
+    responsible_person_id: int
+    status: str
+    reroast_count: int
+    remarks: Optional[str]
+    cancel_reason: Optional[str]
+    created_by: int
+    created_at: datetime
+    updated_at: Optional[datetime]
+    cancelled_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class ReroastTaskDetailResponse(ReroastTaskResponse):
+    batch: Optional[BatchDetailResponse] = None
+    anomaly_disposal: Optional[AnomalyDisposalResponse] = None
+    suggested_fire_level: Optional[FireLevelResponse] = None
+    responsible_person: Optional[PersonResponse] = None
+    retest_record: Optional[ProcessRecordResponse] = None
+    creator: Optional[UserResponse] = None
+    process_records: Optional[List[ProcessRecordResponse]] = None
+
+
+class ReroastTaskInFurnace(BaseModel):
+    furnace_id: Optional[int] = Field(None, description="焙火炉ID，不填则使用原批次炉号")
+    actual_in_time: Optional[datetime] = Field(None, description="实际入炉时间，默认当前时间")
+    temperature: Optional[float] = Field(None, description="入炉温度")
+    remarks: Optional[str] = Field(None, description="备注")
+
+
+class ReroastTaskOutFurnace(BaseModel):
+    actual_out_time: Optional[datetime] = Field(None, description="实际出炉时间，默认当前时间")
+    temperature: Optional[float] = Field(None, description="出炉温度")
+    aroma_description: Optional[str] = Field(None, description="香气描述")
+    remarks: Optional[str] = Field(None, description="备注")
+
+
+class ReroastTaskRetest(BaseModel):
+    retest_conclusion: str = Field(..., description="复测结论: pass/fail/re-roast")
+    burnt_edge_level: Optional[int] = Field(None, description="焦边等级 0-5")
+    temperature: Optional[float] = Field(None, description="温度")
+    aroma_description: Optional[str] = Field(None, description="香气描述")
+    moisture_level: Optional[str] = Field(None, description="含水占位")
+    delivery_suggestion: Optional[str] = Field(None, description="交付建议")
+    remarks: Optional[str] = Field(None, description="备注")
+
+
+class ReroastTaskCancel(BaseModel):
+    cancel_reason: str = Field(..., description="取消原因")
+
+
+class ReroastTodoStats(BaseModel):
+    pending_arrangement_count: int = Field(..., description="待安排数量")
+    pending_in_count: int = Field(..., description="待入炉数量")
+    roasting_count: int = Field(..., description="返焙中数量")
+    pending_retest_count: int = Field(..., description="待复测数量")
+    completed_count: int = Field(..., description="已完成数量")
+    cancelled_count: int = Field(..., description="已取消数量")
+    total_count: int = Field(..., description="总数量")
+    overdue_count: int = Field(..., description="超期未复测数量")
+
+
+class OverdueReroastItem(BaseModel):
+    task_id: int
+    task_no: str
+    batch_code: str
+    status: str
+    responsible_person_name: str
+    plan_out_furnace_time: Optional[datetime]
+    actual_out_furnace_time: Optional[datetime]
+    retest_deadline: Optional[datetime]
+    overdue_hours: float
+
+
+class ReroastTaskQueryParams(BaseModel):
+    task_no: Optional[str] = None
+    batch_code: Optional[str] = None
+    responsible_person_id: Optional[int] = None
+    status: Optional[str] = None
+    plan_date_from: Optional[date] = None
+    plan_date_to: Optional[date] = None
+    is_overdue: Optional[bool] = None

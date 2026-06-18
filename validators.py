@@ -186,6 +186,7 @@ def get_all_alerts(db: Session) -> list:
     all_alerts.extend(check_reroast_missing_retest(db))
     all_alerts.extend(check_person_todo_backlog(db))
     all_alerts.extend(check_anomaly_overdue(db))
+    all_alerts.extend(check_reroast_retest_overdue(db))
     return all_alerts
 
 
@@ -524,4 +525,251 @@ def generate_delivery_no(db: Session) -> str:
 def validate_batch_delivery_eligibility(batch: models.Batch) -> tuple:
     if batch.status not in VALID_DELIVERY_BATCH_STATUSES:
         return False, f"批次当前状态为 '{batch.status}'，不允许交付。仅状态为 'deliverable' 或 'delivered' 的批次可发起交付确认"
+    return True, ""
+
+
+REROAST_TASK_STATUS_NAMES = {
+    "pending_arrangement": "待安排",
+    "pending_in": "待入炉",
+    "roasting": "返焙中",
+    "pending_retest": "待复测",
+    "completed": "已完成",
+    "cancelled": "已取消"
+}
+
+REROAST_STATUS_TRANSITIONS = {
+    "pending_arrangement": ["pending_in", "cancelled"],
+    "pending_in": ["roasting", "cancelled", "pending_arrangement"],
+    "roasting": ["pending_retest", "cancelled"],
+    "pending_retest": ["completed", "cancelled"],
+    "completed": [],
+    "cancelled": []
+}
+
+
+def generate_reroast_task_no(db: Session) -> str:
+    now = datetime.now()
+    prefix = f"RT{now.strftime('%Y%m%d')}"
+    last_task = db.query(models.ReroastTask).filter(
+        models.ReroastTask.task_no.like(f"{prefix}%")
+    ).order_by(models.ReroastTask.task_no.desc()).first()
+
+    if last_task:
+        try:
+            seq = int(last_task.task_no[-4:]) + 1
+        except (ValueError, IndexError):
+            seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def validate_reroast_status_transition(old_status: str, new_status: str) -> tuple:
+    if old_status == new_status:
+        return True, ""
+    allowed = REROAST_STATUS_TRANSITIONS.get(old_status, [])
+    if new_status not in allowed:
+        return False, f"状态流转不允许: {REROAST_TASK_STATUS_NAMES.get(old_status, old_status)} → {REROAST_TASK_STATUS_NAMES.get(new_status, new_status)}。允许的流转: {', '.join([REROAST_TASK_STATUS_NAMES.get(s, s) for s in allowed]) if allowed else '无'}"
+    return True, ""
+
+
+def get_reroast_user_related_filter(db: Session, current_user: models.User):
+    if not current_user:
+        return None
+    if current_user.role == "admin":
+        return None
+    my_person = db.query(models.Person).filter(
+        models.Person.person_name == current_user.full_name
+    ).first()
+    if my_person:
+        return or_(
+            models.ReroastTask.created_by == current_user.id,
+            models.ReroastTask.responsible_person_id == my_person.id
+        )
+    return models.ReroastTask.created_by == current_user.id
+
+
+def is_user_related_to_reroast_task(db: Session, current_user: models.User, task: models.ReroastTask) -> bool:
+    if current_user.role == "admin":
+        return True
+    my_person = db.query(models.Person).filter(
+        models.Person.person_name == current_user.full_name
+    ).first()
+    if task.created_by == current_user.id:
+        return True
+    return bool(my_person and task.responsible_person_id == my_person.id)
+
+
+def check_reroast_retest_overdue(db: Session, current_user: models.User = None) -> list:
+    alerts = []
+    now = datetime.utcnow()
+    pending_retest_statuses = ["pending_retest"]
+
+    query = db.query(models.ReroastTask).filter(
+        models.ReroastTask.status.in_(pending_retest_statuses)
+    ).join(models.Batch).filter(
+        models.Batch.retest_deadline.isnot(None)
+    )
+
+    user_filter = get_reroast_user_related_filter(db, current_user)
+    if user_filter is not None:
+        query = query.filter(user_filter)
+
+    tasks = query.all()
+
+    for task in tasks:
+        batch = task.batch
+        if batch and batch.retest_deadline and batch.retest_deadline < now:
+            hours_overdue = (now - batch.retest_deadline).total_seconds() / 3600
+            level = "critical" if hours_overdue > 48 else "warning"
+            alerts.append(schemas.AlertItem(
+                alert_type="reroast_retest_overdue",
+                alert_level=level,
+                batch_code=batch.batch_code,
+                message=f"返焙任务 [{task.task_no}] 复测超期 {hours_overdue:.1f} 小时",
+                related_data={
+                    "task_id": task.id,
+                    "task_no": task.task_no,
+                    "retest_deadline": batch.retest_deadline.isoformat(),
+                    "responsible_person_id": task.responsible_person_id
+                }
+            ))
+    return alerts
+
+
+def get_reroast_todo_stats(db: Session, current_user: models.User = None) -> schemas.ReroastTodoStats:
+    base_query = db.query(models.ReroastTask)
+
+    user_filter = get_reroast_user_related_filter(db, current_user)
+    if user_filter is not None:
+        base_query = base_query.filter(user_filter)
+
+    pending_arrangement = base_query.filter(models.ReroastTask.status == "pending_arrangement").count()
+    pending_in = base_query.filter(models.ReroastTask.status == "pending_in").count()
+    roasting = base_query.filter(models.ReroastTask.status == "roasting").count()
+    pending_retest = base_query.filter(models.ReroastTask.status == "pending_retest").count()
+    completed = base_query.filter(models.ReroastTask.status == "completed").count()
+    cancelled = base_query.filter(models.ReroastTask.status == "cancelled").count()
+    total = base_query.count()
+
+    now = datetime.utcnow()
+    overdue_query = base_query.filter(
+        models.ReroastTask.status == "pending_retest"
+    ).join(models.Batch).filter(
+        models.Batch.retest_deadline.isnot(None),
+        models.Batch.retest_deadline < now
+    )
+    overdue = overdue_query.count()
+
+    return schemas.ReroastTodoStats(
+        pending_arrangement_count=pending_arrangement,
+        pending_in_count=pending_in,
+        roasting_count=roasting,
+        pending_retest_count=pending_retest,
+        completed_count=completed,
+        cancelled_count=cancelled,
+        total_count=total,
+        overdue_count=overdue
+    )
+
+
+def get_overdue_reroast_tasks(db: Session, current_user: models.User = None) -> list:
+    now = datetime.utcnow()
+
+    query = db.query(models.ReroastTask).filter(
+        models.ReroastTask.status == "pending_retest"
+    ).join(models.Batch).filter(
+        models.Batch.retest_deadline.isnot(None),
+        models.Batch.retest_deadline < now
+    )
+
+    user_filter = get_reroast_user_related_filter(db, current_user)
+    if user_filter is not None:
+        query = query.filter(user_filter)
+
+    tasks = query.order_by(models.Batch.retest_deadline.asc()).all()
+
+    result = []
+    for task in tasks:
+        batch = task.batch
+        person = task.responsible_person
+        if batch and batch.retest_deadline:
+            hours_overdue = (now - batch.retest_deadline).total_seconds() / 3600
+            result.append(schemas.OverdueReroastItem(
+                task_id=task.id,
+                task_no=task.task_no,
+                batch_code=batch.batch_code,
+                status=task.status,
+                responsible_person_name=person.person_name if person else "",
+                plan_out_furnace_time=task.plan_out_furnace_time,
+                actual_out_furnace_time=task.actual_out_furnace_time,
+                retest_deadline=batch.retest_deadline,
+                overdue_hours=round(hours_overdue, 1)
+            ))
+    return result
+
+
+def get_reroast_count_for_batch(db: Session, batch_id: int) -> int:
+    count = db.query(models.ReroastTask).filter(
+        models.ReroastTask.batch_id == batch_id,
+        models.ReroastTask.status != "cancelled"
+    ).count()
+    return count
+
+
+def check_furnace_conflict_for_reroast(
+    db: Session,
+    furnace_id: int,
+    plan_start: datetime,
+    plan_end: datetime,
+    exclude_task_id: int = None
+) -> list:
+    conflicts = []
+    active_task_statuses = ["pending_in", "roasting"]
+
+    query = db.query(models.ReroastTask).filter(
+        models.ReroastTask.status.in_(active_task_statuses),
+        models.ReroastTask.plan_in_furnace_time.isnot(None),
+        models.ReroastTask.plan_out_furnace_time.isnot(None)
+    ).join(models.Batch).filter(
+        models.Batch.furnace_id == furnace_id
+    )
+
+    if exclude_task_id:
+        query = query.filter(models.ReroastTask.id != exclude_task_id)
+
+    tasks = query.all()
+
+    for task in tasks:
+        b_start = task.plan_in_furnace_time
+        b_end = task.plan_out_furnace_time
+
+        has_overlap = (plan_start <= b_end) and (plan_end >= b_start)
+        if has_overlap:
+            batch = task.batch
+            conflicts.append({
+                "task_no": task.task_no,
+                "batch_code": batch.batch_code if batch else "",
+                "reason": f"时间重叠: 该任务 {b_start.strftime('%Y-%m-%d %H:%M')} ~ {b_end.strftime('%Y-%m-%d %H:%M')}"
+            })
+
+    return conflicts
+
+
+def validate_reroast_task_creation(db: Session, batch_id: int) -> tuple:
+    batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+    if not batch:
+        return False, "批次不存在"
+
+    if batch.status not in ["need_reroast", "paused"]:
+        return False, f"批次当前状态为 '{batch.status}'，只有状态为 'need_reroast' 或 'paused' 的批次才能发起返焙任务"
+
+    active_tasks = db.query(models.ReroastTask).filter(
+        models.ReroastTask.batch_id == batch_id,
+        models.ReroastTask.status.in_(["pending_arrangement", "pending_in", "roasting", "pending_retest"])
+    ).count()
+
+    if active_tasks > 0:
+        return False, "该批次已有进行中的返焙任务，请先完成或取消现有任务"
+
     return True, ""

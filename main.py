@@ -1315,6 +1315,522 @@ def get_delivery_summary(
     )
 
 
+@app.post("/qc/reroast-tasks", response_model=schemas.ReroastTaskResponse)
+def create_reroast_task(
+    data: schemas.ReroastTaskCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    is_valid, msg = validators.validate_reroast_task_creation(db, data.batch_id)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
+    if not db.query(models.FireLevel).filter(models.FireLevel.id == data.suggested_fire_level_id).first():
+        raise HTTPException(status_code=400, detail="建议火候等级不存在")
+
+    person = db.query(models.Person).filter(models.Person.id == data.responsible_person_id).first()
+    if not person:
+        raise HTTPException(status_code=400, detail="责任人不存在")
+
+    if data.anomaly_disposal_id:
+        disposal = db.query(models.AnomalyDisposal).filter(
+            models.AnomalyDisposal.id == data.anomaly_disposal_id,
+            models.AnomalyDisposal.batch_id == data.batch_id
+        ).first()
+        if not disposal:
+            raise HTTPException(status_code=400, detail="关联的异常处置单不存在或不属于该批次")
+
+    if data.plan_in_furnace_time and data.plan_out_furnace_time:
+        if data.plan_out_furnace_time <= data.plan_in_furnace_time:
+            raise HTTPException(status_code=400, detail="计划出炉时间必须晚于入炉时间")
+
+        batch = db.query(models.Batch).filter(models.Batch.id == data.batch_id).first()
+        if batch:
+            conflicts = validators.check_furnace_conflict_for_reroast(
+                db, batch.furnace_id, data.plan_in_furnace_time, data.plan_out_furnace_time
+            )
+            if conflicts:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"message": "同一炉号同一时段存在冲突的返焙任务", "conflicts": conflicts}
+                )
+
+    task_no = validators.generate_reroast_task_no(db)
+    reroast_count = validators.get_reroast_count_for_batch(db, data.batch_id) + 1
+
+    initial_status = "pending_arrangement"
+    if data.plan_in_furnace_time and data.plan_out_furnace_time:
+        initial_status = "pending_in"
+
+    task = models.ReroastTask(
+        task_no=task_no,
+        created_by=current_user.id,
+        reroast_count=reroast_count,
+        status=initial_status,
+        **data.model_dump()
+    )
+
+    batch = db.query(models.Batch).filter(models.Batch.id == data.batch_id).first()
+    if batch and batch.status != "need_reroast":
+        batch.status = "need_reroast"
+        batch.updated_at = datetime.utcnow()
+
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.get("/qc/reroast-tasks", response_model=List[schemas.ReroastTaskDetailResponse])
+def list_reroast_tasks(
+    task_no: Optional[str] = Query(None, description="任务编号"),
+    batch_code: Optional[str] = Query(None, description="批次编号"),
+    responsible_person_id: Optional[int] = Query(None, description="责任人ID"),
+    status: Optional[str] = Query(None, description="状态"),
+    plan_date_from: Optional[str] = Query(None, description="计划日期开始 YYYY-MM-DD"),
+    plan_date_to: Optional[str] = Query(None, description="计划日期结束 YYYY-MM-DD"),
+    is_overdue: Optional[bool] = Query(None, description="是否超期"),
+    only_my: bool = Query(False, description="仅查看我相关的"),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    query = db.query(models.ReroastTask)
+
+    if current_user.role != "admin" or only_my:
+        user_filter = validators.get_reroast_user_related_filter(db, current_user)
+        if user_filter is not None:
+            query = query.filter(user_filter)
+
+    if task_no:
+        query = query.filter(models.ReroastTask.task_no.contains(task_no))
+    if status:
+        valid_statuses = list(validators.REROAST_TASK_STATUS_NAMES.keys())
+        if status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"无效状态。有效值: {', '.join(valid_statuses)}")
+        query = query.filter(models.ReroastTask.status == status)
+    if responsible_person_id:
+        query = query.filter(models.ReroastTask.responsible_person_id == responsible_person_id)
+    if batch_code:
+        query = query.join(models.Batch).filter(models.Batch.batch_code.contains(batch_code))
+
+    if plan_date_from:
+        d_from = datetime.strptime(plan_date_from, "%Y-%m-%d")
+        query = query.filter(models.ReroastTask.plan_in_furnace_time >= d_from)
+    if plan_date_to:
+        d_to = datetime.strptime(plan_date_to, "%Y-%m-%d") + timedelta(days=1)
+        query = query.filter(models.ReroastTask.plan_in_furnace_time < d_to)
+
+    if is_overdue is not None:
+        now = datetime.utcnow()
+        if is_overdue:
+            query = query.filter(
+                models.ReroastTask.status == "pending_retest"
+            ).join(models.Batch).filter(
+                models.Batch.retest_deadline.isnot(None),
+                models.Batch.retest_deadline < now
+            )
+        else:
+            subquery = db.query(models.Batch.id).filter(
+                models.Batch.retest_deadline.isnot(None),
+                models.Batch.retest_deadline < now
+            ).subquery()
+            query = query.filter(
+                or_(
+                    models.ReroastTask.status != "pending_retest",
+                    ~models.ReroastTask.batch_id.in_(subquery)
+                )
+            )
+
+    return query.order_by(models.ReroastTask.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/qc/reroast-tasks/{task_id}", response_model=schemas.ReroastTaskDetailResponse)
+def get_reroast_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权查看此返焙任务")
+
+    return task
+
+
+@app.put("/qc/reroast-tasks/{task_id}", response_model=schemas.ReroastTaskResponse)
+def update_reroast_task(
+    task_id: int,
+    data: schemas.ReroastTaskUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权修改此返焙任务")
+
+    if task.status in ["completed", "cancelled"]:
+        raise HTTPException(status_code=400, detail="已完成或已取消的任务不可修改")
+
+    update_data = data.model_dump(exclude_unset=True)
+
+    if data.suggested_fire_level_id is not None:
+        if not db.query(models.FireLevel).filter(models.FireLevel.id == data.suggested_fire_level_id).first():
+            raise HTTPException(status_code=400, detail="建议火候等级不存在")
+
+    if data.responsible_person_id is not None:
+        if not db.query(models.Person).filter(models.Person.id == data.responsible_person_id).first():
+            raise HTTPException(status_code=400, detail="责任人不存在")
+
+    if data.anomaly_disposal_id is not None:
+        disposal = db.query(models.AnomalyDisposal).filter(
+            models.AnomalyDisposal.id == data.anomaly_disposal_id,
+            models.AnomalyDisposal.batch_id == task.batch_id
+        ).first()
+        if not disposal:
+            raise HTTPException(status_code=400, detail="关联的异常处置单不存在或不属于该批次")
+
+    plan_in = data.plan_in_furnace_time or task.plan_in_furnace_time
+    plan_out = data.plan_out_furnace_time or task.plan_out_furnace_time
+    if plan_in and plan_out:
+        if plan_out <= plan_in:
+            raise HTTPException(status_code=400, detail="计划出炉时间必须晚于入炉时间")
+
+        batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+        if batch:
+            conflicts = validators.check_furnace_conflict_for_reroast(
+                db, batch.furnace_id, plan_in, plan_out, exclude_task_id=task_id
+            )
+            if conflicts:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"message": "同一炉号同一时段存在冲突的返焙任务", "conflicts": conflicts}
+                )
+
+    if data.plan_in_furnace_time and data.plan_out_furnace_time and task.status == "pending_arrangement":
+        update_data["status"] = "pending_in"
+
+    for key, value in update_data.items():
+        setattr(task, key, value)
+
+    task.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/qc/reroast-tasks/{task_id}/in-furnace", response_model=schemas.ReroastTaskResponse)
+def reroast_task_in_furnace(
+    task_id: int,
+    data: schemas.ReroastTaskInFurnace,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权操作此返焙任务")
+
+    is_valid, msg = validators.validate_reroast_status_transition(task.status, "roasting")
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
+    batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=400, detail="关联批次不存在")
+
+    furnace_id = data.furnace_id or batch.furnace_id
+    furnace = db.query(models.Furnace).filter(models.Furnace.id == furnace_id).first()
+    if not furnace:
+        raise HTTPException(status_code=400, detail="焙火炉不存在")
+
+    now = data.actual_in_time or datetime.utcnow()
+
+    old_status = task.status
+    task.status = "roasting"
+    task.actual_in_furnace_time = now
+    task.updated_at = now
+
+    batch.status = "roasting"
+    batch.actual_roast_start = now
+    batch.roast_count = (batch.roast_count or 0) + 1
+    batch.updated_at = now
+
+    if data.furnace_id and data.furnace_id != batch.furnace_id:
+        old_furnace = db.query(models.Furnace).filter(models.Furnace.id == batch.furnace_id).first()
+        if old_furnace:
+            old_furnace.status = "idle"
+        batch.furnace_id = data.furnace_id
+
+    furnace.status = "in_use"
+
+    in_record = models.ProcessRecord(
+        batch_id=task.batch_id,
+        reroast_task_id=task.id,
+        record_type="in_furnace",
+        temperature=data.temperature,
+        remarks=data.remarks,
+        recorder_id=current_user.id,
+        recorded_at=now
+    )
+    db.add(in_record)
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/qc/reroast-tasks/{task_id}/out-furnace", response_model=schemas.ReroastTaskResponse)
+def reroast_task_out_furnace(
+    task_id: int,
+    data: schemas.ReroastTaskOutFurnace,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权操作此返焙任务")
+
+    is_valid, msg = validators.validate_reroast_status_transition(task.status, "pending_retest")
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
+    batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=400, detail="关联批次不存在")
+
+    now = data.actual_out_time or datetime.utcnow()
+
+    task.status = "pending_retest"
+    task.actual_out_furnace_time = now
+    task.updated_at = now
+
+    batch.status = "standing"
+    batch.actual_roast_end = now
+    batch.retest_deadline = now + timedelta(hours=batch.retest_cycle_hours or 24)
+    batch.updated_at = now
+
+    furnace = db.query(models.Furnace).filter(models.Furnace.id == batch.furnace_id).first()
+    if furnace:
+        furnace.status = "idle"
+
+    out_record = models.ProcessRecord(
+        batch_id=task.batch_id,
+        reroast_task_id=task.id,
+        record_type="out_furnace",
+        temperature=data.temperature,
+        aroma_description=data.aroma_description,
+        remarks=data.remarks,
+        recorder_id=current_user.id,
+        recorded_at=now
+    )
+    db.add(out_record)
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/qc/reroast-tasks/{task_id}/retest", response_model=schemas.ReroastTaskResponse)
+def reroast_task_retest(
+    task_id: int,
+    data: schemas.ReroastTaskRetest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权操作此返焙任务")
+
+    is_valid, msg = validators.validate_reroast_status_transition(task.status, "completed")
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
+    if data.retest_conclusion not in ["pass", "fail", "re-roast"]:
+        raise HTTPException(status_code=400, detail="复测结论必须是 pass/fail/re-roast")
+
+    if data.burnt_edge_level is not None and (data.burnt_edge_level < 0 or data.burnt_edge_level > 5):
+        raise HTTPException(status_code=400, detail="焦边等级范围 0-5")
+
+    batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=400, detail="关联批次不存在")
+
+    now = datetime.utcnow()
+
+    retest_record = models.ProcessRecord(
+        batch_id=task.batch_id,
+        reroast_task_id=task.id,
+        record_type="retest",
+        temperature=data.temperature,
+        aroma_description=data.aroma_description,
+        moisture_level=data.moisture_level,
+        burnt_edge_level=data.burnt_edge_level,
+        retest_conclusion=data.retest_conclusion,
+        delivery_suggestion=data.delivery_suggestion,
+        remarks=data.remarks,
+        recorder_id=current_user.id,
+        recorded_at=now
+    )
+    db.add(retest_record)
+    db.flush()
+
+    task.retest_record_id = retest_record.id
+    task.retest_conclusion = data.retest_conclusion
+    task.updated_at = now
+
+    if data.retest_conclusion == "pass":
+        task.status = "completed"
+        batch.status = "deliverable"
+    elif data.retest_conclusion == "fail":
+        task.status = "completed"
+        batch.status = "paused"
+    elif data.retest_conclusion == "re-roast":
+        task.status = "completed"
+        batch.status = "need_reroast"
+
+    batch.updated_at = now
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/qc/reroast-tasks/{task_id}/cancel", response_model=schemas.ReroastTaskResponse)
+def cancel_reroast_task(
+    task_id: int,
+    data: schemas.ReroastTaskCancel,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if not validators.is_user_related_to_reroast_task(db, current_user, task):
+        raise HTTPException(status_code=403, detail="无权操作此返焙任务")
+
+    is_valid, msg = validators.validate_reroast_status_transition(task.status, "cancelled")
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
+    batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+
+    now = datetime.utcnow()
+    task.status = "cancelled"
+    task.cancel_reason = data.cancel_reason
+    task.cancelled_at = now
+    task.updated_at = now
+
+    if task.status in ["roasting", "pending_in"] and batch:
+        furnace = db.query(models.Furnace).filter(models.Furnace.id == batch.furnace_id).first()
+        if furnace and furnace.status == "in_use":
+            furnace.status = "idle"
+
+    if batch and batch.status == "need_reroast":
+        batch.status = "paused"
+        batch.updated_at = now
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.delete("/admin/reroast-tasks/{task_id}")
+def delete_reroast_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_admin)
+):
+    task = db.query(models.ReroastTask).filter(models.ReroastTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="返焙任务不存在")
+
+    if task.status == "roasting":
+        batch = db.query(models.Batch).filter(models.Batch.id == task.batch_id).first()
+        if batch:
+            furnace = db.query(models.Furnace).filter(models.Furnace.id == batch.furnace_id).first()
+            if furnace:
+                furnace.status = "idle"
+
+    db.delete(task)
+    db.commit()
+    return {"message": "删除成功"}
+
+
+@app.get("/stats/reroast-todo", response_model=schemas.ReroastTodoStats)
+def get_reroast_todo_stats(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return validators.get_reroast_todo_stats(db, current_user)
+
+
+@app.get("/stats/reroast-overdue", response_model=List[schemas.OverdueReroastItem])
+def get_overdue_reroast_tasks(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return validators.get_overdue_reroast_tasks(db, current_user)
+
+
+@app.get("/qc/reroast-tasks/batch/{batch_id}/history")
+def get_batch_reroast_history(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    tasks = db.query(models.ReroastTask).filter(
+        models.ReroastTask.batch_id == batch_id
+    ).order_by(models.ReroastTask.created_at.desc()).all()
+
+    result = []
+    for task in tasks:
+        result.append({
+            "id": task.id,
+            "task_no": task.task_no,
+            "status": task.status,
+            "status_name": validators.REROAST_TASK_STATUS_NAMES.get(task.status, task.status),
+            "reroast_reason": task.reroast_reason,
+            "reroast_count": task.reroast_count,
+            "suggested_fire_level_id": task.suggested_fire_level_id,
+            "plan_in_furnace_time": task.plan_in_furnace_time.isoformat() if task.plan_in_furnace_time else None,
+            "plan_out_furnace_time": task.plan_out_furnace_time.isoformat() if task.plan_out_furnace_time else None,
+            "actual_in_furnace_time": task.actual_in_furnace_time.isoformat() if task.actual_in_furnace_time else None,
+            "actual_out_furnace_time": task.actual_out_furnace_time.isoformat() if task.actual_out_furnace_time else None,
+            "retest_conclusion": task.retest_conclusion,
+            "responsible_person_id": task.responsible_person_id,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "cancel_reason": task.cancel_reason
+        })
+
+    return {
+        "batch_id": batch.id,
+        "batch_code": batch.batch_code,
+        "total_reroast_count": batch.roast_count - 1 if batch.roast_count > 1 else 0,
+        "reroast_tasks": result
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8111)
