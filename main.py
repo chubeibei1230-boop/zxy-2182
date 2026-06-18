@@ -537,9 +537,9 @@ def create_process_record(
         raise HTTPException(status_code=404, detail="批次不存在")
 
     now = datetime.utcnow()
-    valid_record_types = ["in_furnace", "out_furnace", "to_cabinet", "retest", "delivery"]
+    valid_record_types = ["in_furnace", "out_furnace", "to_cabinet", "retest"]
     if data.record_type not in valid_record_types:
-        raise HTTPException(status_code=400, detail=f"记录类型必须是: {', '.join(valid_record_types)}")
+        raise HTTPException(status_code=400, detail=f"记录类型必须是: {', '.join(valid_record_types)}。注意: 交付请使用成品交付确认模块")
 
     if data.record_type == "in_furnace":
         batch.status = "roasting"
@@ -582,13 +582,6 @@ def create_process_record(
         elif data.retest_conclusion == "re-roast":
             batch.status = "need_reroast"
 
-    elif data.record_type == "delivery":
-        batch.status = "delivered"
-
-        cabinet = db.query(models.Cabinet).filter(models.Cabinet.id == batch.cabinet_id).first()
-        if cabinet:
-            cabinet.status = "empty"
-
     record_data = data.model_dump()
     record_data.pop("batch_id", None)
     record = models.ProcessRecord(
@@ -624,17 +617,20 @@ def list_batch_records(
 @app.put("/qc/batches/{batch_id}/status")
 def update_batch_status(
     batch_id: int,
-    new_status: str = Query(..., description="新状态: pending_in/roasting/standing/pending_retest/need_reroast/deliverable/delivered/paused"),
+    new_status: str = Query(..., description="新状态: pending_in/roasting/standing/pending_retest/need_reroast/deliverable/paused"),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.require_qc)
 ):
-    valid_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable", "delivered", "paused"]
+    valid_statuses = ["pending_in", "roasting", "standing", "pending_retest", "need_reroast", "deliverable", "paused"]
     if new_status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"无效状态。有效值: {', '.join(valid_statuses)}")
+        raise HTTPException(status_code=400, detail=f"无效状态。有效值: {', '.join(valid_statuses)}。注意: delivered 状态只能通过交付确认模块设置")
 
     batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
+
+    if batch.status == "delivered":
+        raise HTTPException(status_code=400, detail="已交付的批次不可直接修改状态，请通过交付确认模块操作")
 
     old_status = batch.status
     batch.status = new_status
@@ -1037,6 +1033,9 @@ def create_delivery_confirmation(
     if data.quality_conclusion not in valid_quality_conclusions:
         raise HTTPException(status_code=400, detail=f"质量确认结论必须是: {', '.join(valid_quality_conclusions)}")
 
+    if data.delivery_quantity <= 0:
+        raise HTTPException(status_code=400, detail="交付数量必须大于 0")
+
     batch = db.query(models.Batch).filter(models.Batch.id == data.batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
@@ -1044,6 +1043,13 @@ def create_delivery_confirmation(
     is_eligible, msg = validators.validate_batch_delivery_eligibility(batch)
     if not is_eligible:
         raise HTTPException(status_code=400, detail=msg)
+
+    existing_confirmed = db.query(models.DeliveryConfirmation).filter(
+        models.DeliveryConfirmation.batch_id == data.batch_id,
+        models.DeliveryConfirmation.status == "confirmed"
+    ).first()
+    if existing_confirmed:
+        raise HTTPException(status_code=400, detail="该批次已有生效的交付确认，不可重复交付")
 
     delivery_no = validators.generate_delivery_no(db)
     now = datetime.utcnow()

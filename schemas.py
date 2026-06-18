@@ -171,7 +171,7 @@ class BatchDetailResponse(BatchResponse):
 
 class ProcessRecordBase(BaseModel):
     batch_id: int = Field(..., description="批次ID")
-    record_type: str = Field(..., description="记录类型: in_furnace/out_furnace/to_cabinet/retest/delivery")
+    record_type: str = Field(..., description="记录类型: in_furnace/out_furnace/to_cabinet/retest")
     temperature: Optional[float] = Field(None, description="温度")
     aroma_description: Optional[str] = Field(None, description="香气描述")
     moisture_level: Optional[str] = Field(None, description="含水占位")
