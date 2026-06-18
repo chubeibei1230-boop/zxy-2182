@@ -863,18 +863,9 @@ def list_anomaly_disposals(
     query = db.query(models.AnomalyDisposal)
 
     if current_user.role != "admin" or only_my:
-        my_person = db.query(models.Person).filter(
-            models.Person.person_name == current_user.full_name
-        ).first()
-        if my_person:
-            query = query.filter(
-                or_(
-                    models.AnomalyDisposal.created_by == current_user.id,
-                    models.AnomalyDisposal.responsible_person_id == my_person.id
-                )
-            )
-        else:
-            query = query.filter(models.AnomalyDisposal.created_by == current_user.id)
+        user_filter = validators.get_user_related_filter(db, current_user)
+        if user_filter is not None:
+            query = query.filter(user_filter)
 
     if disposal_no:
         query = query.filter(models.AnomalyDisposal.disposal_no.contains(disposal_no))
@@ -908,15 +899,8 @@ def get_anomaly_disposal(
     if not disposal:
         raise HTTPException(status_code=404, detail="异常处置单不存在")
 
-    if current_user.role != "admin":
-        my_person = db.query(models.Person).filter(
-            models.Person.person_name == current_user.full_name
-        ).first()
-        is_related = (disposal.created_by == current_user.id)
-        if my_person:
-            is_related = is_related or (disposal.responsible_person_id == my_person.id)
-        if not is_related:
-            raise HTTPException(status_code=403, detail="无权查看此异常处置单")
+    if not validators.is_user_related_to_disposal(db, current_user, disposal):
+        raise HTTPException(status_code=403, detail="无权查看此异常处置单")
 
     return disposal
 
@@ -932,15 +916,8 @@ def update_anomaly_disposal(
     if not disposal:
         raise HTTPException(status_code=404, detail="异常处置单不存在")
 
-    if current_user.role != "admin":
-        my_person = db.query(models.Person).filter(
-            models.Person.person_name == current_user.full_name
-        ).first()
-        is_related = (disposal.created_by == current_user.id)
-        if my_person:
-            is_related = is_related or (disposal.responsible_person_id == my_person.id)
-        if not is_related:
-            raise HTTPException(status_code=403, detail="无权修改此异常处置单")
+    if not validators.is_user_related_to_disposal(db, current_user, disposal):
+        raise HTTPException(status_code=403, detail="无权修改此异常处置单")
 
     if data.status:
         valid_statuses = ["pending", "processing", "completed", "closed"]
@@ -998,15 +975,8 @@ def update_disposal_status(
     if not disposal:
         raise HTTPException(status_code=404, detail="异常处置单不存在")
 
-    if current_user.role != "admin":
-        my_person = db.query(models.Person).filter(
-            models.Person.person_name == current_user.full_name
-        ).first()
-        is_related = (disposal.created_by == current_user.id)
-        if my_person:
-            is_related = is_related or (disposal.responsible_person_id == my_person.id)
-        if not is_related:
-            raise HTTPException(status_code=403, detail="无权修改此异常处置单状态")
+    if not validators.is_user_related_to_disposal(db, current_user, disposal):
+        raise HTTPException(status_code=403, detail="无权修改此异常处置单状态")
 
     valid_statuses = ["pending", "processing", "completed", "closed"]
     if new_status not in valid_statuses:

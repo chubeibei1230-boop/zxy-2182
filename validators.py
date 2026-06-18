@@ -262,7 +262,9 @@ def validate_status_transition(old_status: str, new_status: str) -> tuple:
     return True, ""
 
 
-def _get_user_related_filter(db: Session, current_user: models.User):
+def get_user_related_filter(db: Session, current_user: models.User):
+    if not current_user:
+        return None
     if current_user.role == "admin":
         return None
     my_person = db.query(models.Person).filter(
@@ -276,6 +278,17 @@ def _get_user_related_filter(db: Session, current_user: models.User):
     return models.AnomalyDisposal.created_by == current_user.id
 
 
+def is_user_related_to_disposal(db: Session, current_user: models.User, disposal: models.AnomalyDisposal) -> bool:
+    if current_user.role == "admin":
+        return True
+    my_person = db.query(models.Person).filter(
+        models.Person.person_name == current_user.full_name
+    ).first()
+    if disposal.created_by == current_user.id:
+        return True
+    return bool(my_person and disposal.responsible_person_id == my_person.id)
+
+
 def check_anomaly_overdue(db: Session, current_user: models.User = None) -> list:
     alerts = []
     now = datetime.utcnow()
@@ -286,7 +299,7 @@ def check_anomaly_overdue(db: Session, current_user: models.User = None) -> list
         models.AnomalyDisposal.expected_completion_time.isnot(None)
     )
 
-    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    user_filter = get_user_related_filter(db, current_user)
     if user_filter is not None:
         query = query.filter(user_filter)
 
@@ -321,7 +334,7 @@ def get_uncompleted_anomaly_stats(db: Session, current_user: models.User = None)
         models.AnomalyDisposal.status.in_(active_statuses)
     )
 
-    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    user_filter = get_user_related_filter(db, current_user)
     if user_filter is not None:
         base_query = base_query.filter(user_filter)
 
@@ -355,7 +368,7 @@ def get_overdue_anomalies(db: Session, current_user: models.User = None) -> list
         models.AnomalyDisposal.expected_completion_time < now
     )
 
-    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    user_filter = get_user_related_filter(db, current_user)
     if user_filter is not None:
         query = query.filter(user_filter)
 
@@ -384,10 +397,16 @@ def get_high_risk_fire_anomalies(db: Session, min_batches: int = 5, current_user
     results = []
     fire_levels = db.query(models.FireLevel).all()
 
-    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    user_filter = get_user_related_filter(db, current_user)
 
     for fl in fire_levels:
-        total = db.query(models.Batch).filter(models.Batch.fire_level_id == fl.id).count()
+        total_query = db.query(models.Batch).filter(models.Batch.fire_level_id == fl.id)
+        if user_filter is not None:
+            total_query = total_query.join(models.AnomalyDisposal).filter(
+                models.AnomalyDisposal.status.in_(["pending", "processing"]),
+                user_filter
+            )
+        total = total_query.distinct(models.Batch.id).count()
         if total < min_batches:
             continue
 
@@ -419,7 +438,7 @@ def get_anomaly_summary(db: Session, current_user: models.User = None) -> dict:
     now = datetime.utcnow()
     active_statuses = ["pending", "processing"]
 
-    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    user_filter = get_user_related_filter(db, current_user)
 
     total_active_query = db.query(models.AnomalyDisposal).filter(
         models.AnomalyDisposal.status.in_(active_statuses)
