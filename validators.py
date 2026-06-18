@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 import models
 import schemas
@@ -245,15 +245,52 @@ def generate_disposal_no(db: Session) -> str:
     return f"{prefix}{seq:04d}"
 
 
-def check_anomaly_overdue(db: Session) -> list:
+STATUS_TRANSITIONS = {
+    "pending": ["processing", "closed"],
+    "processing": ["pending", "completed", "closed"],
+    "completed": ["processing"],
+    "closed": []
+}
+
+
+def validate_status_transition(old_status: str, new_status: str) -> tuple:
+    if old_status == new_status:
+        return True, ""
+    allowed = STATUS_TRANSITIONS.get(old_status, [])
+    if new_status not in allowed:
+        return False, f"状态流转不允许: {STATUS_NAMES.get(old_status, old_status)} → {STATUS_NAMES.get(new_status, new_status)}。允许的流转: {', '.join([STATUS_NAMES.get(s, s) for s in allowed]) if allowed else '无'}"
+    return True, ""
+
+
+def _get_user_related_filter(db: Session, current_user: models.User):
+    if current_user.role == "admin":
+        return None
+    my_person = db.query(models.Person).filter(
+        models.Person.person_name == current_user.full_name
+    ).first()
+    if my_person:
+        return or_(
+            models.AnomalyDisposal.created_by == current_user.id,
+            models.AnomalyDisposal.responsible_person_id == my_person.id
+        )
+    return models.AnomalyDisposal.created_by == current_user.id
+
+
+def check_anomaly_overdue(db: Session, current_user: models.User = None) -> list:
     alerts = []
     now = datetime.utcnow()
     active_statuses = ["pending", "processing"]
 
-    overdue_disposals = db.query(models.AnomalyDisposal).filter(
+    query = db.query(models.AnomalyDisposal).filter(
         models.AnomalyDisposal.status.in_(active_statuses),
         models.AnomalyDisposal.expected_completion_time.isnot(None)
-    ).all()
+    )
+
+    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    if user_filter is not None:
+        query = query.filter(user_filter)
+
+    overdue_disposals = query.all()
 
     for disposal in overdue_disposals:
         if disposal.expected_completion_time < now:
@@ -277,18 +314,28 @@ def check_anomaly_overdue(db: Session) -> list:
     return alerts
 
 
-def get_uncompleted_anomaly_stats(db: Session) -> dict:
+def get_uncompleted_anomaly_stats(db: Session, current_user: models.User = None) -> dict:
     active_statuses = ["pending", "processing"]
-    total = db.query(models.AnomalyDisposal).filter(
+
+    base_query = db.query(models.AnomalyDisposal).filter(
         models.AnomalyDisposal.status.in_(active_statuses)
-    ).count()
+    )
+
+    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    if user_filter is not None:
+        base_query = base_query.filter(user_filter)
+
+    total = base_query.count()
 
     stats = []
     for anomaly_type, type_name in ANOMALY_TYPE_NAMES.items():
-        count = db.query(models.AnomalyDisposal).filter(
+        query = db.query(models.AnomalyDisposal).filter(
             models.AnomalyDisposal.anomaly_type == anomaly_type,
             models.AnomalyDisposal.status.in_(active_statuses)
-        ).count()
+        )
+        if user_filter is not None:
+            query = query.filter(user_filter)
+        count = query.count()
         if count > 0:
             stats.append(schemas.AnomalyStatsItem(
                 anomaly_type=anomaly_type,
@@ -299,14 +346,20 @@ def get_uncompleted_anomaly_stats(db: Session) -> dict:
     return {"total_uncompleted": total, "by_type": stats}
 
 
-def get_overdue_anomalies(db: Session) -> list:
+def get_overdue_anomalies(db: Session, current_user: models.User = None) -> list:
     now = datetime.utcnow()
     active_statuses = ["pending", "processing"]
 
-    disposals = db.query(models.AnomalyDisposal).filter(
+    query = db.query(models.AnomalyDisposal).filter(
         models.AnomalyDisposal.status.in_(active_statuses),
         models.AnomalyDisposal.expected_completion_time < now
-    ).order_by(models.AnomalyDisposal.expected_completion_time.asc()).all()
+    )
+
+    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+    if user_filter is not None:
+        query = query.filter(user_filter)
+
+    disposals = query.order_by(models.AnomalyDisposal.expected_completion_time.asc()).all()
 
     result = []
     for disposal in disposals:
@@ -327,19 +380,25 @@ def get_overdue_anomalies(db: Session) -> list:
     return result
 
 
-def get_high_risk_fire_anomalies(db: Session, min_batches: int = 5) -> list:
+def get_high_risk_fire_anomalies(db: Session, min_batches: int = 5, current_user: models.User = None) -> list:
     results = []
     fire_levels = db.query(models.FireLevel).all()
+
+    user_filter = _get_user_related_filter(db, current_user) if current_user else None
 
     for fl in fire_levels:
         total = db.query(models.Batch).filter(models.Batch.fire_level_id == fl.id).count()
         if total < min_batches:
             continue
 
-        anomaly_count = db.query(models.AnomalyDisposal).join(models.Batch).filter(
+        anomaly_query = db.query(models.AnomalyDisposal).join(models.Batch).filter(
             models.Batch.fire_level_id == fl.id,
             models.AnomalyDisposal.status.in_(["pending", "processing"])
-        ).distinct(models.AnomalyDisposal.id).count()
+        )
+        if user_filter is not None:
+            anomaly_query = anomaly_query.filter(user_filter)
+
+        anomaly_count = anomaly_query.distinct(models.AnomalyDisposal.id).count()
 
         if anomaly_count > 0:
             rate = anomaly_count / total if total > 0 else 0
@@ -354,3 +413,64 @@ def get_high_risk_fire_anomalies(db: Session, min_batches: int = 5) -> list:
 
     results.sort(key=lambda x: x.anomaly_rate, reverse=True)
     return results
+
+
+def get_anomaly_summary(db: Session, current_user: models.User = None) -> dict:
+    now = datetime.utcnow()
+    active_statuses = ["pending", "processing"]
+
+    user_filter = _get_user_related_filter(db, current_user) if current_user else None
+
+    total_active_query = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses)
+    )
+    if user_filter is not None:
+        total_active_query = total_active_query.filter(user_filter)
+    total_active = total_active_query.count()
+
+    overdue_query = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.expected_completion_time < now
+    )
+    if user_filter is not None:
+        overdue_query = overdue_query.filter(user_filter)
+    overdue_count = overdue_query.count()
+
+    critical_query = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.severity == "critical"
+    )
+    if user_filter is not None:
+        critical_query = critical_query.filter(user_filter)
+    critical_count = critical_query.count()
+
+    high_query = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.severity == "high"
+    )
+    if user_filter is not None:
+        high_query = high_query.filter(user_filter)
+    high_count = high_query.count()
+
+    today_created_query = db.query(models.AnomalyDisposal).filter(
+        func.date(models.AnomalyDisposal.created_at) == func.date(now)
+    )
+    if user_filter is not None:
+        today_created_query = today_created_query.filter(user_filter)
+    today_created = today_created_query.count()
+
+    today_completed_query = db.query(models.AnomalyDisposal).filter(
+        func.date(models.AnomalyDisposal.completed_at) == func.date(now)
+    )
+    if user_filter is not None:
+        today_completed_query = today_completed_query.filter(user_filter)
+    today_completed = today_completed_query.count()
+
+    return {
+        "total_active": total_active,
+        "overdue_count": overdue_count,
+        "critical_count": critical_count,
+        "high_count": high_count,
+        "today_created": today_created,
+        "today_completed": today_completed
+    }

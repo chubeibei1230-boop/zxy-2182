@@ -822,6 +822,8 @@ def create_anomaly_disposal(
         ).first()
         if not record:
             raise HTTPException(status_code=404, detail="关联的复测记录不存在")
+        if record.record_type != "retest":
+            raise HTTPException(status_code=400, detail=f"只能关联复测记录，当前记录类型为: {record.record_type}")
 
     person = db.query(models.Person).filter(models.Person.id == data.responsible_person_id).first()
     if not person:
@@ -945,12 +947,18 @@ def update_anomaly_disposal(
         if data.status not in valid_statuses:
             raise HTTPException(status_code=400, detail=f"状态必须是: {', '.join(valid_statuses)}")
 
+        is_valid, msg = validators.validate_status_transition(disposal.status, data.status)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=msg)
+
         if data.status in ["completed", "closed"] and not data.final_result and not disposal.final_result:
             raise HTTPException(status_code=400, detail="完成或关闭处置单时必须填写最终处理结果")
 
         old_status = disposal.status
         if data.status == "completed" and old_status != "completed":
             disposal.completed_at = datetime.utcnow()
+        elif old_status in ["completed", "closed"] and data.status not in ["completed", "closed"]:
+            disposal.completed_at = None
 
     if data.severity:
         valid_severities = ["low", "medium", "high", "critical"]
@@ -1004,6 +1012,10 @@ def update_disposal_status(
     if new_status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"状态必须是: {', '.join(valid_statuses)}")
 
+    is_valid, msg = validators.validate_status_transition(disposal.status, new_status)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=msg)
+
     if new_status in ["completed", "closed"] and not final_result and not disposal.final_result:
         raise HTTPException(status_code=400, detail="完成或关闭处置单时必须填写最终处理结果")
 
@@ -1013,6 +1025,8 @@ def update_disposal_status(
 
     if new_status == "completed" and old_status != "completed":
         disposal.completed_at = datetime.utcnow()
+    elif old_status in ["completed", "closed"] and new_status not in ["completed", "closed"]:
+        disposal.completed_at = None
 
     if final_result:
         disposal.final_result = final_result
@@ -1048,7 +1062,7 @@ def get_uncompleted_anomaly_stats(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    return validators.get_uncompleted_anomaly_stats(db)
+    return validators.get_uncompleted_anomaly_stats(db, current_user)
 
 
 @app.get("/stats/anomaly-overdue", response_model=List[schemas.OverdueAnomalyItem])
@@ -1056,7 +1070,7 @@ def get_overdue_anomalies(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    return validators.get_overdue_anomalies(db)
+    return validators.get_overdue_anomalies(db, current_user)
 
 
 @app.get("/stats/high-risk-fire-anomalies", response_model=List[schemas.HighRiskFireAnomalyItem])
@@ -1065,7 +1079,7 @@ def get_high_risk_fire_anomalies(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    return validators.get_high_risk_fire_anomalies(db, min_batches)
+    return validators.get_high_risk_fire_anomalies(db, min_batches, current_user)
 
 
 @app.get("/stats/anomaly-summary")
@@ -1073,44 +1087,7 @@ def get_anomaly_summary(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    now = datetime.utcnow()
-    active_statuses = ["pending", "processing"]
-
-    total_active = db.query(models.AnomalyDisposal).filter(
-        models.AnomalyDisposal.status.in_(active_statuses)
-    ).count()
-
-    overdue_count = db.query(models.AnomalyDisposal).filter(
-        models.AnomalyDisposal.status.in_(active_statuses),
-        models.AnomalyDisposal.expected_completion_time < now
-    ).count()
-
-    critical_count = db.query(models.AnomalyDisposal).filter(
-        models.AnomalyDisposal.status.in_(active_statuses),
-        models.AnomalyDisposal.severity == "critical"
-    ).count()
-
-    high_count = db.query(models.AnomalyDisposal).filter(
-        models.AnomalyDisposal.status.in_(active_statuses),
-        models.AnomalyDisposal.severity == "high"
-    ).count()
-
-    today_created = db.query(models.AnomalyDisposal).filter(
-        func.date(models.AnomalyDisposal.created_at) == func.date(now)
-    ).count()
-
-    today_completed = db.query(models.AnomalyDisposal).filter(
-        func.date(models.AnomalyDisposal.completed_at) == func.date(now)
-    ).count()
-
-    return {
-        "total_active": total_active,
-        "overdue_count": overdue_count,
-        "critical_count": critical_count,
-        "high_count": high_count,
-        "today_created": today_created,
-        "today_completed": today_completed
-    }
+    return validators.get_anomaly_summary(db, current_user)
 
 
 if __name__ == "__main__":
