@@ -235,3 +235,86 @@ class TodoItem(BaseModel):
     person_name: str
     pending_count: int
     batches: List[dict]
+
+
+class AnomalyDisposalBase(BaseModel):
+    batch_id: int = Field(..., description="批次ID")
+    process_record_id: Optional[int] = Field(None, description="关联的复测记录ID")
+    anomaly_type: str = Field(..., description="异常类型: retest_fail/burnt_edge_high/retest_overdue/reroast_abnormal")
+    severity: str = Field(..., description="严重程度: low/medium/high/critical")
+    reason_description: str = Field(..., description="原因说明")
+    disposal_suggestion: str = Field(..., description="处置建议")
+    responsible_person_id: int = Field(..., description="责任人ID")
+    expected_completion_time: datetime = Field(..., description="预计完成时间")
+
+
+class AnomalyDisposalCreate(AnomalyDisposalBase):
+    pass
+
+
+class AnomalyDisposalUpdate(BaseModel):
+    status: Optional[str] = Field(None, description="状态: pending/processing/completed/closed")
+    final_result: Optional[str] = Field(None, description="最终处理结果")
+    severity: Optional[str] = Field(None, description="严重程度: low/medium/high/critical")
+    reason_description: Optional[str] = Field(None, description="原因说明")
+    disposal_suggestion: Optional[str] = Field(None, description="处置建议")
+    responsible_person_id: Optional[int] = Field(None, description="责任人ID")
+    expected_completion_time: Optional[datetime] = Field(None, description="预计完成时间")
+
+
+class AnomalyDisposalResponse(BaseModel):
+    id: int
+    disposal_no: str
+    batch_id: int
+    process_record_id: Optional[int]
+    anomaly_type: str
+    severity: str
+    reason_description: str
+    disposal_suggestion: str
+    responsible_person_id: int
+    expected_completion_time: datetime
+    final_result: Optional[str]
+    status: str
+    created_by: int
+    handled_by: Optional[int]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class AnomalyDisposalDetailResponse(AnomalyDisposalResponse):
+    batch: Optional[BatchDetailResponse] = None
+    process_record: Optional[ProcessRecordResponse] = None
+    responsible_person: Optional[PersonResponse] = None
+    creator: Optional[UserResponse] = None
+    handler: Optional[UserResponse] = None
+
+
+class AnomalyStatsItem(BaseModel):
+    anomaly_type: str
+    anomaly_type_name: str
+    count: int
+
+
+class OverdueAnomalyItem(BaseModel):
+    disposal_id: int
+    disposal_no: str
+    batch_code: str
+    anomaly_type: str
+    severity: str
+    responsible_person_name: str
+    expected_completion_time: datetime
+    overdue_hours: float
+    status: str
+
+
+class HighRiskFireAnomalyItem(BaseModel):
+    fire_level_id: int
+    fire_level_code: str
+    fire_level_name: str
+    anomaly_count: int
+    total_batches: int
+    anomaly_rate: float

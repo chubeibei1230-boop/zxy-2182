@@ -108,6 +108,7 @@ class Batch(Base):
     cabinet = relationship("Cabinet", back_populates="batches")
     person = relationship("Person", back_populates="batches")
     process_records = relationship("ProcessRecord", back_populates="batch", cascade="all, delete-orphan")
+    anomaly_disposals = relationship("AnomalyDisposal", back_populates="batch", cascade="all, delete-orphan")
 
 
 class ProcessRecord(Base):
@@ -128,3 +129,32 @@ class ProcessRecord(Base):
 
     batch = relationship("Batch", back_populates="process_records")
     recorder = relationship("User", back_populates="records")
+    anomaly_disposals = relationship("AnomalyDisposal", back_populates="process_record")
+
+
+class AnomalyDisposal(Base):
+    __tablename__ = "anomaly_disposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    disposal_no = Column(String(50), unique=True, index=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False)
+    process_record_id = Column(Integer, ForeignKey("process_records.id"))
+    anomaly_type = Column(String(50), nullable=False)
+    severity = Column(String(20), nullable=False)
+    reason_description = Column(Text, nullable=False)
+    disposal_suggestion = Column(Text, nullable=False)
+    responsible_person_id = Column(Integer, ForeignKey("persons.id"), nullable=False)
+    expected_completion_time = Column(DateTime, nullable=False)
+    final_result = Column(Text)
+    status = Column(String(20), default="pending")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    handled_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime)
+
+    batch = relationship("Batch", back_populates="anomaly_disposals")
+    process_record = relationship("ProcessRecord", back_populates="anomaly_disposals")
+    responsible_person = relationship("Person", foreign_keys=[responsible_person_id])
+    creator = relationship("User", foreign_keys=[created_by])
+    handler = relationship("User", foreign_keys=[handled_by])

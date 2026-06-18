@@ -797,6 +797,322 @@ def get_person_backlog(
     return results
 
 
+@app.post("/qc/anomaly-disposals", response_model=schemas.AnomalyDisposalResponse)
+def create_anomaly_disposal(
+    data: schemas.AnomalyDisposalCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    valid_anomaly_types = ["retest_fail", "burnt_edge_high", "retest_overdue", "reroast_abnormal"]
+    if data.anomaly_type not in valid_anomaly_types:
+        raise HTTPException(status_code=400, detail=f"异常类型必须是: {', '.join(valid_anomaly_types)}")
+
+    valid_severities = ["low", "medium", "high", "critical"]
+    if data.severity not in valid_severities:
+        raise HTTPException(status_code=400, detail=f"严重程度必须是: {', '.join(valid_severities)}")
+
+    batch = db.query(models.Batch).filter(models.Batch.id == data.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    if data.process_record_id:
+        record = db.query(models.ProcessRecord).filter(
+            models.ProcessRecord.id == data.process_record_id,
+            models.ProcessRecord.batch_id == data.batch_id
+        ).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="关联的复测记录不存在")
+
+    person = db.query(models.Person).filter(models.Person.id == data.responsible_person_id).first()
+    if not person:
+        raise HTTPException(status_code=404, detail="责任人不存在")
+
+    if data.expected_completion_time <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="预计完成时间必须晚于当前时间")
+
+    disposal_no = validators.generate_disposal_no(db)
+    disposal = models.AnomalyDisposal(
+        disposal_no=disposal_no,
+        created_by=current_user.id,
+        **data.model_dump()
+    )
+    db.add(disposal)
+    db.commit()
+    db.refresh(disposal)
+    return disposal
+
+
+@app.get("/qc/anomaly-disposals", response_model=List[schemas.AnomalyDisposalDetailResponse])
+def list_anomaly_disposals(
+    disposal_no: Optional[str] = Query(None, description="异常处置单编号"),
+    batch_code: Optional[str] = Query(None, description="批次编码"),
+    anomaly_type: Optional[str] = Query(None, description="异常类型"),
+    severity: Optional[str] = Query(None, description="严重程度"),
+    status: Optional[str] = Query(None, description="状态: pending/processing/completed/closed"),
+    responsible_person_id: Optional[int] = Query(None, description="责任人ID"),
+    date_from: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+    only_my: bool = Query(False, description="仅查看我相关的"),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    query = db.query(models.AnomalyDisposal)
+
+    if current_user.role != "admin" or only_my:
+        my_person = db.query(models.Person).filter(
+            models.Person.person_name == current_user.full_name
+        ).first()
+        if my_person:
+            query = query.filter(
+                or_(
+                    models.AnomalyDisposal.created_by == current_user.id,
+                    models.AnomalyDisposal.responsible_person_id == my_person.id
+                )
+            )
+        else:
+            query = query.filter(models.AnomalyDisposal.created_by == current_user.id)
+
+    if disposal_no:
+        query = query.filter(models.AnomalyDisposal.disposal_no.contains(disposal_no))
+    if anomaly_type:
+        query = query.filter(models.AnomalyDisposal.anomaly_type == anomaly_type)
+    if severity:
+        query = query.filter(models.AnomalyDisposal.severity == severity)
+    if status:
+        query = query.filter(models.AnomalyDisposal.status == status)
+    if responsible_person_id:
+        query = query.filter(models.AnomalyDisposal.responsible_person_id == responsible_person_id)
+    if batch_code:
+        query = query.join(models.Batch).filter(models.Batch.batch_code.contains(batch_code))
+    if date_from:
+        d_from = datetime.strptime(date_from, "%Y-%m-%d")
+        query = query.filter(models.AnomalyDisposal.created_at >= d_from)
+    if date_to:
+        d_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
+        query = query.filter(models.AnomalyDisposal.created_at < d_to)
+
+    return query.order_by(models.AnomalyDisposal.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/qc/anomaly-disposals/{disposal_id}", response_model=schemas.AnomalyDisposalDetailResponse)
+def get_anomaly_disposal(
+    disposal_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    disposal = db.query(models.AnomalyDisposal).filter(models.AnomalyDisposal.id == disposal_id).first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="异常处置单不存在")
+
+    if current_user.role != "admin":
+        my_person = db.query(models.Person).filter(
+            models.Person.person_name == current_user.full_name
+        ).first()
+        is_related = (disposal.created_by == current_user.id)
+        if my_person:
+            is_related = is_related or (disposal.responsible_person_id == my_person.id)
+        if not is_related:
+            raise HTTPException(status_code=403, detail="无权查看此异常处置单")
+
+    return disposal
+
+
+@app.put("/qc/anomaly-disposals/{disposal_id}", response_model=schemas.AnomalyDisposalResponse)
+def update_anomaly_disposal(
+    disposal_id: int,
+    data: schemas.AnomalyDisposalUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    disposal = db.query(models.AnomalyDisposal).filter(models.AnomalyDisposal.id == disposal_id).first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="异常处置单不存在")
+
+    if current_user.role != "admin":
+        my_person = db.query(models.Person).filter(
+            models.Person.person_name == current_user.full_name
+        ).first()
+        is_related = (disposal.created_by == current_user.id)
+        if my_person:
+            is_related = is_related or (disposal.responsible_person_id == my_person.id)
+        if not is_related:
+            raise HTTPException(status_code=403, detail="无权修改此异常处置单")
+
+    if data.status:
+        valid_statuses = ["pending", "processing", "completed", "closed"]
+        if data.status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"状态必须是: {', '.join(valid_statuses)}")
+
+        if data.status in ["completed", "closed"] and not data.final_result and not disposal.final_result:
+            raise HTTPException(status_code=400, detail="完成或关闭处置单时必须填写最终处理结果")
+
+        old_status = disposal.status
+        if data.status == "completed" and old_status != "completed":
+            disposal.completed_at = datetime.utcnow()
+
+    if data.severity:
+        valid_severities = ["low", "medium", "high", "critical"]
+        if data.severity not in valid_severities:
+            raise HTTPException(status_code=400, detail=f"严重程度必须是: {', '.join(valid_severities)}")
+
+    if data.responsible_person_id:
+        person = db.query(models.Person).filter(models.Person.id == data.responsible_person_id).first()
+        if not person:
+            raise HTTPException(status_code=404, detail="责任人不存在")
+
+    if data.expected_completion_time and data.expected_completion_time <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="预计完成时间必须晚于当前时间")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if data.status in ["processing", "completed", "closed"]:
+        update_data["handled_by"] = current_user.id
+
+    for key, value in update_data.items():
+        setattr(disposal, key, value)
+
+    disposal.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(disposal)
+    return disposal
+
+
+@app.put("/qc/anomaly-disposals/{disposal_id}/status")
+def update_disposal_status(
+    disposal_id: int,
+    new_status: str = Query(..., description="新状态: pending/processing/completed/closed"),
+    final_result: Optional[str] = Query(None, description="最终处理结果（完成或关闭时必填）"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    disposal = db.query(models.AnomalyDisposal).filter(models.AnomalyDisposal.id == disposal_id).first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="异常处置单不存在")
+
+    if current_user.role != "admin":
+        my_person = db.query(models.Person).filter(
+            models.Person.person_name == current_user.full_name
+        ).first()
+        is_related = (disposal.created_by == current_user.id)
+        if my_person:
+            is_related = is_related or (disposal.responsible_person_id == my_person.id)
+        if not is_related:
+            raise HTTPException(status_code=403, detail="无权修改此异常处置单状态")
+
+    valid_statuses = ["pending", "processing", "completed", "closed"]
+    if new_status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"状态必须是: {', '.join(valid_statuses)}")
+
+    if new_status in ["completed", "closed"] and not final_result and not disposal.final_result:
+        raise HTTPException(status_code=400, detail="完成或关闭处置单时必须填写最终处理结果")
+
+    old_status = disposal.status
+    disposal.status = new_status
+    disposal.handled_by = current_user.id
+
+    if new_status == "completed" and old_status != "completed":
+        disposal.completed_at = datetime.utcnow()
+
+    if final_result:
+        disposal.final_result = final_result
+
+    disposal.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "message": "状态更新成功",
+        "disposal_no": disposal.disposal_no,
+        "old_status": old_status,
+        "new_status": new_status
+    }
+
+
+@app.delete("/admin/anomaly-disposals/{disposal_id}")
+def delete_anomaly_disposal(
+    disposal_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_admin)
+):
+    disposal = db.query(models.AnomalyDisposal).filter(models.AnomalyDisposal.id == disposal_id).first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="异常处置单不存在")
+
+    db.delete(disposal)
+    db.commit()
+    return {"message": "删除成功"}
+
+
+@app.get("/stats/anomaly-uncompleted")
+def get_uncompleted_anomaly_stats(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return validators.get_uncompleted_anomaly_stats(db)
+
+
+@app.get("/stats/anomaly-overdue", response_model=List[schemas.OverdueAnomalyItem])
+def get_overdue_anomalies(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return validators.get_overdue_anomalies(db)
+
+
+@app.get("/stats/high-risk-fire-anomalies", response_model=List[schemas.HighRiskFireAnomalyItem])
+def get_high_risk_fire_anomalies(
+    min_batches: int = Query(5, description="最少批次数"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return validators.get_high_risk_fire_anomalies(db, min_batches)
+
+
+@app.get("/stats/anomaly-summary")
+def get_anomaly_summary(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    now = datetime.utcnow()
+    active_statuses = ["pending", "processing"]
+
+    total_active = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses)
+    ).count()
+
+    overdue_count = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.expected_completion_time < now
+    ).count()
+
+    critical_count = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.severity == "critical"
+    ).count()
+
+    high_count = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.severity == "high"
+    ).count()
+
+    today_created = db.query(models.AnomalyDisposal).filter(
+        func.date(models.AnomalyDisposal.created_at) == func.date(now)
+    ).count()
+
+    today_completed = db.query(models.AnomalyDisposal).filter(
+        func.date(models.AnomalyDisposal.completed_at) == func.date(now)
+    ).count()
+
+    return {
+        "total_active": total_active,
+        "overdue_count": overdue_count,
+        "critical_count": critical_count,
+        "high_count": high_count,
+        "today_created": today_created,
+        "today_completed": today_completed
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8111)

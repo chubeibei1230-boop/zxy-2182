@@ -185,6 +185,7 @@ def get_all_alerts(db: Session) -> list:
     all_alerts.extend(check_burnt_edge_concentration(db))
     all_alerts.extend(check_reroast_missing_retest(db))
     all_alerts.extend(check_person_todo_backlog(db))
+    all_alerts.extend(check_anomaly_overdue(db))
     return all_alerts
 
 
@@ -203,3 +204,153 @@ def generate_batch_code(db: Session) -> str:
     else:
         seq = 1
     return f"{prefix}{seq:04d}"
+
+
+ANOMALY_TYPE_NAMES = {
+    "retest_fail": "复测不通过",
+    "burnt_edge_high": "焦边等级偏高",
+    "retest_overdue": "复测超期",
+    "reroast_abnormal": "返焙后仍异常"
+}
+
+SEVERITY_NAMES = {
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "critical": "严重"
+}
+
+STATUS_NAMES = {
+    "pending": "待处理",
+    "processing": "处理中",
+    "completed": "已完成",
+    "closed": "已关闭"
+}
+
+
+def generate_disposal_no(db: Session) -> str:
+    now = datetime.now()
+    prefix = f"AD{now.strftime('%Y%m%d')}"
+    last_disposal = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.disposal_no.like(f"{prefix}%")
+    ).order_by(models.AnomalyDisposal.disposal_no.desc()).first()
+
+    if last_disposal:
+        try:
+            seq = int(last_disposal.disposal_no[-4:]) + 1
+        except (ValueError, IndexError):
+            seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def check_anomaly_overdue(db: Session) -> list:
+    alerts = []
+    now = datetime.utcnow()
+    active_statuses = ["pending", "processing"]
+
+    overdue_disposals = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.expected_completion_time.isnot(None)
+    ).all()
+
+    for disposal in overdue_disposals:
+        if disposal.expected_completion_time < now:
+            hours_overdue = (now - disposal.expected_completion_time).total_seconds() / 3600
+            level = "critical" if hours_overdue > 24 else "warning"
+            batch = db.query(models.Batch).filter(models.Batch.id == disposal.batch_id).first()
+            alerts.append(schemas.AlertItem(
+                alert_type="anomaly_overdue",
+                alert_level=level,
+                batch_code=batch.batch_code if batch else None,
+                message=f"异常处置单 [{disposal.disposal_no}] 超期 {hours_overdue:.1f} 小时",
+                related_data={
+                    "disposal_id": disposal.id,
+                    "disposal_no": disposal.disposal_no,
+                    "anomaly_type": disposal.anomaly_type,
+                    "severity": disposal.severity,
+                    "expected_completion_time": disposal.expected_completion_time.isoformat(),
+                    "responsible_person_id": disposal.responsible_person_id
+                }
+            ))
+    return alerts
+
+
+def get_uncompleted_anomaly_stats(db: Session) -> dict:
+    active_statuses = ["pending", "processing"]
+    total = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses)
+    ).count()
+
+    stats = []
+    for anomaly_type, type_name in ANOMALY_TYPE_NAMES.items():
+        count = db.query(models.AnomalyDisposal).filter(
+            models.AnomalyDisposal.anomaly_type == anomaly_type,
+            models.AnomalyDisposal.status.in_(active_statuses)
+        ).count()
+        if count > 0:
+            stats.append(schemas.AnomalyStatsItem(
+                anomaly_type=anomaly_type,
+                anomaly_type_name=type_name,
+                count=count
+            ))
+
+    return {"total_uncompleted": total, "by_type": stats}
+
+
+def get_overdue_anomalies(db: Session) -> list:
+    now = datetime.utcnow()
+    active_statuses = ["pending", "processing"]
+
+    disposals = db.query(models.AnomalyDisposal).filter(
+        models.AnomalyDisposal.status.in_(active_statuses),
+        models.AnomalyDisposal.expected_completion_time < now
+    ).order_by(models.AnomalyDisposal.expected_completion_time.asc()).all()
+
+    result = []
+    for disposal in disposals:
+        hours_overdue = (now - disposal.expected_completion_time).total_seconds() / 3600
+        batch = db.query(models.Batch).filter(models.Batch.id == disposal.batch_id).first()
+        person = db.query(models.Person).filter(models.Person.id == disposal.responsible_person_id).first()
+        result.append(schemas.OverdueAnomalyItem(
+            disposal_id=disposal.id,
+            disposal_no=disposal.disposal_no,
+            batch_code=batch.batch_code if batch else "",
+            anomaly_type=disposal.anomaly_type,
+            severity=disposal.severity,
+            responsible_person_name=person.person_name if person else "",
+            expected_completion_time=disposal.expected_completion_time,
+            overdue_hours=round(hours_overdue, 1),
+            status=disposal.status
+        ))
+    return result
+
+
+def get_high_risk_fire_anomalies(db: Session, min_batches: int = 5) -> list:
+    results = []
+    fire_levels = db.query(models.FireLevel).all()
+
+    for fl in fire_levels:
+        total = db.query(models.Batch).filter(models.Batch.fire_level_id == fl.id).count()
+        if total < min_batches:
+            continue
+
+        anomaly_count = db.query(models.AnomalyDisposal).join(models.Batch).filter(
+            models.Batch.fire_level_id == fl.id,
+            models.AnomalyDisposal.status.in_(["pending", "processing"])
+        ).distinct(models.AnomalyDisposal.id).count()
+
+        if anomaly_count > 0:
+            rate = anomaly_count / total if total > 0 else 0
+            results.append(schemas.HighRiskFireAnomalyItem(
+                fire_level_id=fl.id,
+                fire_level_code=fl.level_code,
+                fire_level_name=fl.level_name,
+                anomaly_count=anomaly_count,
+                total_batches=total,
+                anomaly_rate=round(rate, 4)
+            ))
+
+    results.sort(key=lambda x: x.anomaly_rate, reverse=True)
+    return results
