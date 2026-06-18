@@ -1027,6 +1027,208 @@ def delete_anomaly_disposal(
     return {"message": "删除成功"}
 
 
+@app.post("/qc/delivery-confirmations", response_model=schemas.DeliveryConfirmationResponse)
+def create_delivery_confirmation(
+    data: schemas.DeliveryConfirmationCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    valid_quality_conclusions = ["qualified", "conditional_qualified", "unqualified"]
+    if data.quality_conclusion not in valid_quality_conclusions:
+        raise HTTPException(status_code=400, detail=f"质量确认结论必须是: {', '.join(valid_quality_conclusions)}")
+
+    batch = db.query(models.Batch).filter(models.Batch.id == data.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    is_eligible, msg = validators.validate_batch_delivery_eligibility(batch)
+    if not is_eligible:
+        raise HTTPException(status_code=400, detail=msg)
+
+    delivery_no = validators.generate_delivery_no(db)
+    now = datetime.utcnow()
+
+    delivery = models.DeliveryConfirmation(
+        delivery_no=delivery_no,
+        batch_id=data.batch_id,
+        delivery_quantity=data.delivery_quantity,
+        delivery_target=data.delivery_target,
+        delivery_time=data.delivery_time,
+        delivery_remarks=data.delivery_remarks,
+        quality_conclusion=data.quality_conclusion,
+        status="confirmed",
+        confirmed_by=current_user.id,
+        confirmed_at=now
+    )
+    db.add(delivery)
+
+    batch.status = "delivered"
+    batch.updated_at = now
+
+    cabinet = db.query(models.Cabinet).filter(models.Cabinet.id == batch.cabinet_id).first()
+    if cabinet:
+        cabinet.status = "empty"
+
+    db.commit()
+    db.refresh(delivery)
+    return delivery
+
+
+@app.get("/qc/delivery-confirmations", response_model=List[schemas.DeliveryConfirmationDetailResponse])
+def list_delivery_confirmations(
+    batch_code: Optional[str] = Query(None, description="批次编号"),
+    tea_batch_no: Optional[str] = Query(None, description="茶坯批号"),
+    confirmed_by: Optional[int] = Query(None, description="操作人ID"),
+    status: Optional[str] = Query(None, description="交付状态: confirmed/cancelled"),
+    date_from: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    query = db.query(models.DeliveryConfirmation)
+
+    if batch_code:
+        query = query.join(models.Batch).filter(models.Batch.batch_code.contains(batch_code))
+    if tea_batch_no:
+        query = query.join(models.Batch).join(models.TeaStock).filter(models.TeaStock.batch_no.contains(tea_batch_no))
+    if confirmed_by:
+        query = query.filter(models.DeliveryConfirmation.confirmed_by == confirmed_by)
+    if status:
+        query = query.filter(models.DeliveryConfirmation.status == status)
+    if date_from:
+        d_from = datetime.strptime(date_from, "%Y-%m-%d")
+        query = query.filter(models.DeliveryConfirmation.delivery_time >= d_from)
+    if date_to:
+        d_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
+        query = query.filter(models.DeliveryConfirmation.delivery_time < d_to)
+
+    return query.order_by(models.DeliveryConfirmation.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/qc/delivery-confirmations/{delivery_id}", response_model=schemas.DeliveryConfirmationDetailResponse)
+def get_delivery_confirmation(
+    delivery_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    delivery = db.query(models.DeliveryConfirmation).filter(models.DeliveryConfirmation.id == delivery_id).first()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="交付确认记录不存在")
+    return delivery
+
+
+@app.put("/qc/delivery-confirmations/{delivery_id}", response_model=schemas.DeliveryConfirmationResponse)
+def update_delivery_confirmation(
+    delivery_id: int,
+    data: schemas.DeliveryConfirmationUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_qc)
+):
+    delivery = db.query(models.DeliveryConfirmation).filter(models.DeliveryConfirmation.id == delivery_id).first()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="交付确认记录不存在")
+
+    if data.status:
+        valid_statuses = ["confirmed", "cancelled"]
+        if data.status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"状态必须是: {', '.join(valid_statuses)}")
+        if delivery.status == "cancelled":
+            raise HTTPException(status_code=400, detail="已取消的交付确认不可变更")
+
+    if data.quality_conclusion:
+        valid_quality_conclusions = ["qualified", "conditional_qualified", "unqualified"]
+        if data.quality_conclusion not in valid_quality_conclusions:
+            raise HTTPException(status_code=400, detail=f"质量确认结论必须是: {', '.join(valid_quality_conclusions)}")
+
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(delivery, key, value)
+
+    if data.status == "cancelled":
+        batch = db.query(models.Batch).filter(models.Batch.id == delivery.batch_id).first()
+        if batch:
+            other_confirmed = db.query(models.DeliveryConfirmation).filter(
+                models.DeliveryConfirmation.batch_id == delivery.batch_id,
+                models.DeliveryConfirmation.id != delivery_id,
+                models.DeliveryConfirmation.status == "confirmed"
+            ).first()
+            if not other_confirmed:
+                batch.status = "deliverable"
+                batch.updated_at = datetime.utcnow()
+
+    delivery.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(delivery)
+    return delivery
+
+
+@app.get("/qc/delivery-confirmations/batch/{batch_id}/history")
+def get_batch_delivery_history(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    deliveries = db.query(models.DeliveryConfirmation).filter(
+        models.DeliveryConfirmation.batch_id == batch_id
+    ).order_by(models.DeliveryConfirmation.created_at.desc()).all()
+
+    process_records = db.query(models.ProcessRecord).filter(
+        models.ProcessRecord.batch_id == batch_id
+    ).order_by(models.ProcessRecord.recorded_at.asc()).all()
+
+    return {
+        "batch": {
+            "id": batch.id,
+            "batch_code": batch.batch_code,
+            "status": batch.status,
+            "tea_stock_id": batch.tea_stock_id,
+            "furnace_id": batch.furnace_id,
+            "fire_level_id": batch.fire_level_id,
+            "person_id": batch.person_id,
+            "created_at": batch.created_at.isoformat() if batch.created_at else None,
+            "updated_at": batch.updated_at.isoformat() if batch.updated_at else None
+        },
+        "delivery_confirmations": [
+            {
+                "id": d.id,
+                "delivery_no": d.delivery_no,
+                "delivery_quantity": d.delivery_quantity,
+                "delivery_target": d.delivery_target,
+                "delivery_time": d.delivery_time.isoformat() if d.delivery_time else None,
+                "delivery_remarks": d.delivery_remarks,
+                "quality_conclusion": d.quality_conclusion,
+                "status": d.status,
+                "confirmed_by": d.confirmed_by,
+                "confirmed_at": d.confirmed_at.isoformat() if d.confirmed_at else None,
+                "created_at": d.created_at.isoformat() if d.created_at else None
+            }
+            for d in deliveries
+        ],
+        "process_records": [
+            {
+                "id": r.id,
+                "record_type": r.record_type,
+                "temperature": r.temperature,
+                "aroma_description": r.aroma_description,
+                "moisture_level": r.moisture_level,
+                "burnt_edge_level": r.burnt_edge_level,
+                "retest_conclusion": r.retest_conclusion,
+                "delivery_suggestion": r.delivery_suggestion,
+                "remarks": r.remarks,
+                "recorder_id": r.recorder_id,
+                "recorded_at": r.recorded_at.isoformat() if r.recorded_at else None
+            }
+            for r in process_records
+        ]
+    }
+
+
 @app.get("/stats/anomaly-uncompleted")
 def get_uncompleted_anomaly_stats(
     db: Session = Depends(get_db),
@@ -1058,6 +1260,53 @@ def get_anomaly_summary(
     current_user: models.User = Depends(auth.get_current_user)
 ):
     return validators.get_anomaly_summary(db, current_user)
+
+
+@app.get("/stats/delivery-summary", response_model=schemas.DeliverySummaryResponse)
+def get_delivery_summary(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    pending_delivery_count = db.query(models.Batch).filter(
+        models.Batch.status == "deliverable"
+    ).count()
+
+    delivered_count = db.query(models.Batch).filter(
+        models.Batch.status == "delivered"
+    ).count()
+
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=6)
+
+    trend = []
+    for i in range(7):
+        current_date = start_date + timedelta(days=i)
+        next_date = current_date + timedelta(days=1)
+
+        total = db.query(models.Batch).filter(
+            models.Batch.created_at >= datetime.combine(current_date, datetime.min.time()),
+            models.Batch.created_at < datetime.combine(next_date, datetime.min.time())
+        ).count()
+
+        delivered = db.query(models.Batch).filter(
+            models.Batch.status == "delivered",
+            models.Batch.updated_at >= datetime.combine(current_date, datetime.min.time()),
+            models.Batch.updated_at < datetime.combine(next_date, datetime.min.time())
+        ).count()
+
+        rate = delivered / total if total > 0 else 0
+        trend.append(schemas.DeliveryTrendItem(
+            date=current_date.isoformat(),
+            total_batches=total,
+            delivered_count=delivered,
+            delivery_rate=round(rate, 4)
+        ))
+
+    return schemas.DeliverySummaryResponse(
+        pending_delivery_count=pending_delivery_count,
+        delivered_count=delivered_count,
+        recent_7day_trend=trend
+    )
 
 
 if __name__ == "__main__":

@@ -493,3 +493,35 @@ def get_anomaly_summary(db: Session, current_user: models.User = None) -> dict:
         "today_created": today_created,
         "today_completed": today_completed
     }
+
+
+VALID_DELIVERY_BATCH_STATUSES = ["deliverable", "delivered"]
+
+QUALITY_CONCLUSION_NAMES = {
+    "qualified": "合格",
+    "conditional_qualified": "条件合格",
+    "unqualified": "不合格"
+}
+
+
+def generate_delivery_no(db: Session) -> str:
+    now = datetime.now()
+    prefix = f"DC{now.strftime('%Y%m%d')}"
+    last_delivery = db.query(models.DeliveryConfirmation).filter(
+        models.DeliveryConfirmation.delivery_no.like(f"{prefix}%")
+    ).order_by(models.DeliveryConfirmation.delivery_no.desc()).first()
+
+    if last_delivery:
+        try:
+            seq = int(last_delivery.delivery_no[-4:]) + 1
+        except (ValueError, IndexError):
+            seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def validate_batch_delivery_eligibility(batch: models.Batch) -> tuple:
+    if batch.status not in VALID_DELIVERY_BATCH_STATUSES:
+        return False, f"批次当前状态为 '{batch.status}'，不允许交付。仅状态为 'deliverable' 或 'delivered' 的批次可发起交付确认"
+    return True, ""

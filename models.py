@@ -109,6 +109,28 @@ class Batch(Base):
     person = relationship("Person", back_populates="batches")
     process_records = relationship("ProcessRecord", back_populates="batch", cascade="all, delete-orphan")
     anomaly_disposals = relationship("AnomalyDisposal", back_populates="batch", cascade="all, delete-orphan")
+    delivery_confirmations = relationship("DeliveryConfirmation", back_populates="batch")
+
+
+class DeliveryConfirmation(Base):
+    __tablename__ = "delivery_confirmations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    delivery_no = Column(String(50), unique=True, index=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("batches.id"), nullable=False)
+    delivery_quantity = Column(Float, nullable=False)
+    delivery_target = Column(String(200), nullable=False)
+    delivery_time = Column(DateTime, nullable=False)
+    delivery_remarks = Column(Text)
+    quality_conclusion = Column(String(20), nullable=False)
+    status = Column(String(20), default="confirmed")
+    confirmed_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    confirmed_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
+
+    batch = relationship("Batch", back_populates="delivery_confirmations")
+    confirmer = relationship("User", foreign_keys=[confirmed_by])
 
 
 class ProcessRecord(Base):

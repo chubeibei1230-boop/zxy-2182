@@ -318,3 +318,55 @@ class HighRiskFireAnomalyItem(BaseModel):
     anomaly_count: int
     total_batches: int
     anomaly_rate: float
+
+
+class DeliveryConfirmationBase(BaseModel):
+    batch_id: int = Field(..., description="批次ID")
+    delivery_quantity: float = Field(..., description="交付数量(kg)")
+    delivery_target: str = Field(..., description="交付对象")
+    delivery_time: datetime = Field(..., description="交付时间")
+    delivery_remarks: Optional[str] = Field(None, description="交付备注")
+    quality_conclusion: str = Field(..., description="质量确认结论: qualified/conditional_qualified/unqualified")
+
+
+class DeliveryConfirmationCreate(DeliveryConfirmationBase):
+    pass
+
+
+class DeliveryConfirmationUpdate(BaseModel):
+    delivery_quantity: Optional[float] = Field(None, description="交付数量(kg)")
+    delivery_target: Optional[str] = Field(None, description="交付对象")
+    delivery_time: Optional[datetime] = Field(None, description="交付时间")
+    delivery_remarks: Optional[str] = Field(None, description="交付备注")
+    quality_conclusion: Optional[str] = Field(None, description="质量确认结论: qualified/conditional_qualified/unqualified")
+    status: Optional[str] = Field(None, description="状态: confirmed/cancelled")
+
+
+class DeliveryConfirmationResponse(BaseModel):
+    id: int
+    delivery_no: str
+    batch_id: int
+    delivery_quantity: float
+    delivery_target: str
+    delivery_time: datetime
+    delivery_remarks: Optional[str]
+    quality_conclusion: str
+    status: str
+    confirmed_by: int
+    confirmed_at: datetime
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class DeliveryConfirmationDetailResponse(DeliveryConfirmationResponse):
+    batch: Optional[BatchDetailResponse] = None
+    confirmer: Optional[UserResponse] = None
+
+
+class DeliverySummaryResponse(BaseModel):
+    pending_delivery_count: int = Field(..., description="待交付数量")
+    delivered_count: int = Field(..., description="已交付数量")
+    recent_7day_trend: List[DeliveryTrendItem] = Field(..., description="近7日交付趋势")
